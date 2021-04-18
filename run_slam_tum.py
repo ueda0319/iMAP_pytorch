@@ -6,18 +6,22 @@ import csv
 import cv2
 import threading
 from model import Camera, Mapper
-
-def read_files(folder_path="/home/itsuki/RGBD/rgbd_dataset_freiburg1_teddy/"):
+# load image files in TUM directories
+def read_files(folder_path="rgbd_dataset_freiburg1_teddy/"):
+    # rgb file pathes
     csv_file = open(folder_path + "rgb.txt", "r")
     f = csv.reader(csv_file, delimiter=" ")
+    # skip headers
     next(f)
     next(f)
     next(f)
     rgb_filenames = []
     for row in f:
         rgb_filenames.append("{}{}".format(folder_path, row[1]))
+    # depth file pathes
     csv_file = open(folder_path + "depth.txt", "r")
     f = csv.reader(csv_file, delimiter=" ")
+    # skip headers
     next(f)
     next(f)
     next(f)
@@ -26,6 +30,7 @@ def read_files(folder_path="/home/itsuki/RGBD/rgbd_dataset_freiburg1_teddy/"):
         depth_filenames.append("{}{}".format(folder_path, row[1]))
     return rgb_filenames, depth_filenames
 
+# Thread for mapping loop
 def mappingThread(mapper):
     while True:
         mapper.mapping()
@@ -59,6 +64,7 @@ def main():
 
     mapping_thread = threading.Thread(target=mappingThread, args=(mapper,))
     mapping_thread.start()
+    # Start tracking
     for frame in range(1,frame_length):
         tracking_camera.params.data += camera_vel
         tracking_camera.setImages(cv2.imread(rgb_filenames[frame], cv2.IMREAD_COLOR), 
