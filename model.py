@@ -4,9 +4,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import cv2
-import glob
-import os
-import csv
+import copy
+import time
+from visualizer import Visualizer
+#import mcubes
+@torch.jit.script
+def mish(x):
+    return x * torch.tanh(F.softplus(x))
 class IMAP(nn.Module):
     def __init__(self):
         super(IMAP, self).__init__()
@@ -16,26 +20,27 @@ class IMAP(nn.Module):
         self.fc2 = nn.Linear(256,256).cuda()
         self.fc3 = nn.Linear(256+93,256).cuda()
         self.fc4 = nn.Linear(256,256).cuda()
-        self.fc5 = nn.Linear(256,4).cuda()
+        self.fc5 = nn.Linear(256,4, bias=False).cuda()
         self.fc5.weight.data[3,:]*=0.1
     def forward(self, pos):
-        #v=self.B(pos) * 2 * np.pi
-        gamma =torch.sin(self.B(pos))#torch.cat([torch.sin(v), torch.cos(v)], axis=1)
+        # Position embedding
+        gamma =torch.sin(self.B(pos))
+        # NeRF model
         h1 = F.relu(self.fc1(gamma))
         h2 = torch.cat([F.relu(self.fc2(h1)), gamma],dim=1)
         h3 = F.relu(self.fc3(h2))
         h4 = F.relu(self.fc4(h3))
-        #out = F.sigmoid(self.fc4(h3))
         out = self.fc5(h4)
         return out
 
 class Camera():
     def __init__(self, rgb, depth, px,py,pz,rx,ry,rz,a=0.0, b=0.0,fx=525.0, fy=525.0, cx=319.5, cy=239.5):
         self.params = torch.tensor([rx,ry,rz,px,py,pz,a,b]).detach().cuda().requires_grad_(True)
-        self.fx = 525.0
-        self.fy = 525.0
-        self.cx = 319.5
-        self.cy = 239.5
+        # Camera Calibrations
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
         self.K = torch.from_numpy(np.array([
             [fx, 0.0, cx],
             [0.0, fy, cy],
@@ -46,38 +51,34 @@ class Camera():
             [0.0, 1.0/fy, -cy/fy],
             [0.0, 0.0, 1.0],
             ]).astype(np.float32)).cuda().requires_grad_(False)
+        # For convert depth from 16bit color
         self.factor = 1 / 50000.0
+        # Images cache
         self.rgb = torch.from_numpy((rgb).astype(np.float32)).cuda()*(1.0/256)
         self.depth = torch.from_numpy(depth.astype(np.float32)).cuda()*self.factor
-        #print(torch.mean(self.depth))
-        #self.cw = torch.cuda.FloatTensor(4,4).fill_(0)
-        #self.wc = torch.cuda.FloatTensor(4,4).fill_(0)
+        # Lighting parameter
         self.exp_a = torch.cuda.FloatTensor(1)
         self.R = torch.cuda.FloatTensor(3,3).fill_(0)
         self.T = torch.cuda.FloatTensor(3,3).fill_(0)
         self.Li = torch.cuda.FloatTensor(64).fill_(1.0/64)
         self.size = depth.shape
         self.update_transform()
-        self.optimizer = optim.Adam([self.params], lr=0.01)
+        self.optimizer = optim.Adam([self.params], lr=0.005)
     def setImages(self, rgb, depth):
         self.rgb = torch.from_numpy((rgb).astype(np.float32)).cuda()*(1.0/256)
         self.depth = torch.from_numpy(depth.astype(np.float32)).cuda()*self.factor
+    # Calc Transform from camera parameters
     def update_transform(self):
-
-        #with torch.no_grad():
         i = torch.cuda.FloatTensor(3,3).fill_(0)
         i[0,0] = 1
         i[1,1] = 1
         i[2,2] = 1
-        #w1 = torch.cuda.FloatTensor(3,3).fill_(0)
         w1 = torch.cuda.FloatTensor(3,3).fill_(0)
         w1[1, 2] = -1
         w1[2, 1] = 1
-        #w2 = torch.cuda.FloatTensor(3,3).fill_(0)
         w2 = torch.cuda.FloatTensor(3,3).fill_(0)
         w2[2, 0] = -1
         w2[0, 2] = 1
-        #w3 = torch.cuda.FloatTensor(3,3).fill_(0)
         w3 = torch.cuda.FloatTensor(3,3).fill_(0)
         w3[0, 1] = -1
         w3[1, 0] = 1
@@ -99,50 +100,30 @@ class Camera():
         p = torch.cuda.FloatTensor(batch_size, 3,1).fill_(1)
         p[:, 0, 0] = u
         p[:, 1, 0] = v
-        pd = torch.cuda.FloatTensor(batch_size, 4,1).fill_(1)
-        pd[:, :3,:] = torch.matmul(self.Ki, p)
-        ray = torch.matmul(self.R, torch.matmul(self.Ki, p))[:,:,0]#torch.matmul(self.wc, pd)[:, :3,0]
+        ray = torch.matmul(self.R, torch.matmul(self.Ki, p))[:,:,0]
+        # Normalize Ray Vector
         with torch.no_grad():
             ray_li = (1.0/torch.norm(ray, dim=1).reshape(batch_size,1).expand(batch_size,3))
         rayn = ray * ray_li
-        #ds = torch.linspace(imin,imax,step).cuda()
-        return rayn, self.T.reshape(1,3).expand(batch_size,3)#.reshape(batch_size, 1,3).expand(batch_size, step,3) * ds.reshape(1, step,1).expand(batch_size, step,3), ds.reshape(1, step).expand(batch_size, step)
+        return rayn, self.T.reshape(1,3).expand(batch_size,3)
     
-# Hierarchical sampling (section 5.2)
-def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+# Hierarchical sampling 
+def sample_pdf(bins, weights, N_samples):
     # Get pdf
-    weights = weights + 1e-5 # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    weights = weights + 1e-5
+    pdf = weights * torch.reciprocal(torch.sum(weights, -1, keepdim=True))
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)
 
-    # Take uniform samples
-    if det:
-        u = torch.linspace(0., 1., steps=N_samples).cuda()
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
-    else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples]).cuda()
-
-    # Pytest, overwrite u with numpy's fixed random numbers
-    if pytest:
-        np.random.seed(0)
-        new_shape = list(cdf.shape[:-1]) + [N_samples]
-        if det:
-            u = np.linspace(0., 1., N_samples)
-            u = np.broadcast_to(u, new_shape)
-        else:
-            u = np.random.rand(*new_shape)
-        u = torch.Tensor(u).cuda()
+    u = torch.rand(list(cdf.shape[:-1]) + [N_samples]).cuda()
 
     # Invert CDF
     u = u.contiguous()
     inds = torch.searchsorted(cdf, u, right=True)
     below = torch.max(torch.zeros_like(inds-1), inds-1)
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+    inds_g = torch.stack([below, above], -1)  
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
@@ -158,36 +139,42 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
 class Mapper():
     def __init__(self):
         self.model = IMAP().cuda()
+        self.model_tracking = IMAP().cuda()
         self.cameras = []
-        #self.track_optimizers = []
-
-        #rgb = cv2.imread("/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/rgb/1305032353.993165.png", cv2.IMREAD_COLOR)
-        #depth = cv2.imread("/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/depth/1305032354.009456.png", cv2.IMREAD_ANYDEPTH)
-        #camera = Camera(rgb, depth)
-        #self.cameras.append(camera)
-
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005)
-        self.lp = nn.L1Loss()
-        self.lg = nn.L1Loss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.005)
         self.render_id=0
+    def updateModelForTracking(self):
+        self.model_tracking.load_state_dict(copy.deepcopy(self.model.state_dict()))
     def addCamera(self, rgb_filename, depth_filename, px,py,pz,rx,ry,rz, a, b):
         rgb = cv2.imread(rgb_filename, cv2.IMREAD_COLOR)
         depth = cv2.imread(depth_filename, cv2.IMREAD_ANYDEPTH)
         camera = Camera(rgb, depth, px,py,pz,rx,ry,rz,a,b)
         self.cameras.append(camera)
-        #self.track_optimizers.append(optim.Adam([camera.params]))
-    def render_ray(self, u, v, camera_id):
-        step = 128
-        rays, ds = self.cameras[camera_id].rays(u,v, step=step)
-        outs = self.model(rays)
-        deltas = ds[1:] - ds[:-1]
-        o = 1-torch.exp(-outs[:-1,3]*deltas)
-        wo = torch.cumprod(o, 0)
-        w = torch.cuda.FloatTensor(step-1).fill_(0)
-        w[1:] = o[1:] * wo[:-1]
-        dh = w * ds[:-1]
-        ih = w.reshape(-1,1).expand(-1,3) * outs[:-1, :3]
-        return torch.sum(dh), torch.sum(ih,axis=0)
+    '''
+    def render_marching_cube(self, voxel_size=64, threshold=30.0):
+        with torch.no_grad():
+            vs = 2.4/voxel_size
+            t = np.linspace(-1.2, 1.2, voxel_size+1)
+            query_pts = np.stack(np.meshgrid(t, t, t), -1).astype(np.float32)
+            sampling = torch.from_numpy(query_pts.reshape([-1,3])).cuda()
+            print(sampling.cpu())
+            out = self.model(sampling)
+            sigma=out[:,3].detach().cpu().numpy().reshape(voxel_size+1,voxel_size+1,voxel_size+1)
+            print(np.min(sigma), np.max(sigma))
+            vertices, triangles = mcubes.marching_cubes(sigma, threshold)
+            if vertices.shape[0]==0:
+                return np.zeros((3,3), np.float32), np.zeros((3,3), np.float32)
+            print(vertices.shape)
+            color_sampling = torch.from_numpy(np.stack(vertices, -1).astype(np.float32).reshape([-1,3]))*vs-1.2
+
+            out = self.model(color_sampling.cuda())
+            colors = out[:,:3].detach().cpu().numpy()
+
+            vt=vertices[triangles.flatten()]*vs
+            cl = colors[triangles.flatten()]
+            return vt,cl
+    '''
+        
     def volume_render(self, dists, sigmas):
         max_dist = 1.5
         batch_size = dists.shape[0]
@@ -204,19 +191,24 @@ class Mapper():
         i = torch.sum(ih, dim=1)
         dv = torch.sum(w*torch.square(dists[:, :-1]-d.reshape(batch_size,1).expand(batch_size, step-1)), dim=1)
 
-        # WhiteBack
+        # BlackBack
         d += wo[:,-1] *max_dist
-        i += wo[:,-1].reshape(batch_size,1).expand(batch_size,3)
+        #i += wo[:,-1].reshape(batch_size,1).expand(batch_size,3)
+        # dv *= torch.reciprocal(torch.sum(w,axis=1))
         return d,i,dv
 
-    def render_rays(self, u, v, camera, n_coarse=32, n_fine=12):
+    def render_rays(self, u, v, camera, n_coarse=32, n_fine=12, model_freeze=False):
+        if model_freeze:
+            model=self.model_tracking
+        else:
+            model=self.model
         batch_size = u.shape[0]
         ray, orig= camera.rays_batch(u,v)
 
         with torch.no_grad():
-            ds = torch.linspace(0.0001,0.8,n_coarse).cuda().reshape(1, n_coarse).expand(batch_size, n_coarse)
+            ds = torch.linspace(0.0001,1.2,n_coarse).cuda().reshape(1, n_coarse).expand(batch_size, n_coarse)
             rays = orig.reshape(batch_size, 1,3).expand(batch_size, n_coarse,3) + ray.reshape(batch_size, 1,3).expand(batch_size, n_coarse,3)* ds.reshape(batch_size, n_coarse,1).expand(batch_size, n_coarse,3)
-            sigmas = self.model(rays.reshape(-1,3)).reshape(batch_size,n_coarse, 4)
+            sigmas = model(rays.reshape(-1,3)).reshape(batch_size,n_coarse, 4)
         
             delta = ds[0,1]-ds[0,0]
             o = 1-torch.exp(-sigmas[:, :,3]*delta)[:,1:]
@@ -225,10 +217,10 @@ class Mapper():
             ds_fine = sample_pdf(ds, w, n_fine)
         rays_fine = orig.reshape(batch_size, 1,3).expand(batch_size, n_coarse+n_fine,3) + ray.reshape(batch_size, 1,3).expand(batch_size, n_coarse+n_fine,3)* ds_fine.reshape(batch_size, n_coarse+n_fine,1).expand(batch_size, n_coarse+n_fine,3)
         
-        sigmas_fine = self.model(rays_fine.reshape(-1,3)).reshape(batch_size,n_coarse+n_fine, 4)
-        #d,i,dv = self.volume_render(ds, sigmas)
+        sigmas_fine = model(rays_fine.reshape(-1,3)).reshape(batch_size,n_coarse+n_fine, 4)
         d_f,i_f,dv_f = self.volume_render(ds_fine, sigmas_fine)
         return d_f,camera.exp_a*i_f+camera.params[7],dv_f
+    # render Full image
     def render(self, camera):
         with torch.no_grad():
             h = camera.size[0]
@@ -246,6 +238,7 @@ class Mapper():
             rgb_cv = torch.clamp(rgb*255, 0, 255).detach().cpu().numpy().astype(np.uint8)
             depth_cv = torch.clamp(depth*50000/256, 0, 255).detach().cpu().numpy().astype(np.uint8)
             return rgb_cv, depth_cv
+    # render preview image
     def render_small(self, camera, label):
         with torch.no_grad():
             camera.update_transform()
@@ -271,41 +264,14 @@ class Mapper():
             self.render_id+=1
             cv2.imshow("{}_rgb".format(label), prev)
             cv2.waitKey(1)
-    def learn(self, camera_id):
-        self.optimizer.zero_grad()
-        self.cameras[camera_id].optimizer.zero_grad()
-        self.cameras[camera_id].update_transform()
-        batch_size = 200
-        h = self.cameras[camera_id].size[0]
-        w = self.cameras[camera_id].size[1]
-        us = (torch.rand(batch_size)*(w-1)).to(torch.int16).cuda()
-        vs = (torch.rand(batch_size)*(h-1)).to(torch.int16).cuda()
-        depth, rgb, depth_var = self.render_rays(us, vs, self.cameras[camera_id])
-        rgb_gt = torch.cat([self.cameras[camera_id].rgb[v, u, :].unsqueeze(0) for u, v in zip(us, vs)])
-        depth_gt = torch.cat([self.cameras[camera_id].depth[v, u].unsqueeze(0) for u, v in zip(us, vs)])
-        depth[depth_gt==0]=0
-        with torch.no_grad():
-            ivar = torch.reciprocal(torch.sqrt(depth_var))
-            ivar[ivar.isinf()]=1
-            ivar[ivar.isnan()]=1
-        lg = self.lg(depth*ivar, depth_gt*ivar)
-        lp = self.lp(rgb,rgb_gt)
-        loss = lg+lp
-        loss.backward(retain_graph=True)
-        #print(lg_f, lp_f)
-        self.optimizer.step()
-        #self.optimizer_fine.step()
-        if camera_id>0:
-            #print(self.cameras[camera_id].params)
-            self.cameras[camera_id].optimizer.step()
+    # Mapping step
     def mapping(self, batch_size = 200, activeSampling=True):
         if len(self.cameras)<5:
             camera_ids = np.arange(len(self.cameras))
         else:
-            camera_ids = np.random.randint(0,len(self.cameras),5)
-            camera_ids[0] = len(self.cameras)-1
-            camera_ids[1] = len(self.cameras)-2
-        batch_size = 200
+            camera_ids = np.random.randint(0,len(self.cameras)-2,5)
+            camera_ids[3] = len(self.cameras)-1
+            camera_ids[4] = len(self.cameras)-2
         
         for camera_id in camera_ids:
             self.optimizer.zero_grad()
@@ -343,16 +309,16 @@ class Mapper():
                 ivar = torch.reciprocal(torch.sqrt(depth_var))
                 ivar[ivar.isinf()]=1
                 ivar[ivar.isnan()]=1
-            lg = self.lg(depth*ivar, depth_gt*ivar)
-            lp = 5*self.lp(rgb,rgb_gt)
+            lg = torch.mean(torch.abs(depth-depth_gt)*ivar)
+            lp = 5*torch.mean(torch.abs(rgb-rgb_gt))
 
             
             loss = lg+lp
             loss.backward()#retain_graph=True)
-
-            #print(lg.detach().cpu(), lp.detach().cpu())
             self.optimizer.step()
-            self.cameras[camera_id].optimizer.step()
+            #print(lg.detach().cpu(), lp.detach().cpu())
+            if camera_id > 0:
+                self.cameras[camera_id].optimizer.step()
 
             # Update ActiveSampling
             if activeSampling:
@@ -365,20 +331,17 @@ class Mapper():
                         Li[i] = torch.mean(e[ris[i-1]:ris[i]])
                     LiS = 1.0 / torch.sum(Li)
                     self.cameras[camera_id].Li = LiS * Li
-            #print(self.cameras[camera_id].params)
-
-
-    def track(self, camera):
-        #camera.optimizer = optim.Adam([camera.params])
-        batch_size = 200
-        for iter in range(30):
+    # Tracking step
+    def track(self, camera, batch_size = 200):
+        self.updateModelForTracking()
+        for iter in range(20):
             camera.optimizer.zero_grad()
             camera.update_transform()
             h = camera.size[0]
             w = camera.size[1]
             us = (torch.rand(batch_size)*(w-1)).to(torch.int16).cuda()
             vs = (torch.rand(batch_size)*(h-1)).to(torch.int16).cuda()
-            depth, rgb, depth_var = self.render_rays(us, vs, camera)
+            depth, rgb, depth_var = self.render_rays(us, vs, camera, model_freeze=True)
             rgb_gt = torch.cat([camera.rgb[v, u, :].unsqueeze(0) for u, v in zip(us, vs)])
             depth_gt = torch.cat([camera.depth[v, u].unsqueeze(0) for u, v in zip(us, vs)])
             depth[depth_gt==0]=0
@@ -386,78 +349,14 @@ class Mapper():
                 ivar = torch.reciprocal(torch.sqrt(depth_var))
                 ivar[ivar.isinf()]=1
                 ivar[ivar.isnan()]=1
-            lg = self.lg(depth*ivar, depth_gt*ivar)
-            lp = 5*self.lp(rgb,rgb_gt)
+            lg = torch.mean(torch.abs(depth-depth_gt)*ivar)
+            lp = 5*torch.mean(torch.abs(rgb-rgb_gt))
             loss = lg+lp
-            loss.backward()#retain_graph=True)
-
-            #print(camera.params)
+            loss.backward()
             camera.optimizer.step()
-        p = float(torch.sum(((torch.abs(depth - depth_gt) * torch.reciprocal(depth_gt+1e-12)) < 0.1).int()).cpu().item()) /batch_size
-        print("P", p)
+            p = float(torch.sum(((torch.abs(depth - depth_gt) * torch.reciprocal(depth_gt+1e-12)) < 0.1).int()).cpu().item()) /batch_size
+            if p>0.8:
+                break
+        print("Tracking: P=", p)
         #del camera.optimizer
         return p
-def read_files(folder_path="/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/"):
-    csv_file = open(folder_path + "rgb.txt", "r")
-    f = csv.reader(csv_file, delimiter=" ")
-    next(f)
-    next(f)
-    next(f)
-    rgb_filenames = []
-    for row in f:
-        rgb_filenames.append("{}{}".format(folder_path, row[1]))
-    csv_file = open(folder_path + "depth.txt", "r")
-    f = csv.reader(csv_file, delimiter=" ")
-    next(f)
-    next(f)
-    next(f)
-    depth_filenames = []
-    for row in f:
-        depth_filenames.append("{}{}".format(folder_path, row[1]))
-    return rgb_filenames, depth_filenames
-def main():
-    mapper = Mapper()
-    #mapper.addCamera("/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/rgb/1305032353.993165.png",
-    #                "/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/depth/1305032354.009456.png",
-    #                0.0, -0.0,  0.0,  -0.0, 0.0,  0.0)
-    #rgb_filenames = glob.glob("/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/rgb/*.png")
-    #depth_filenames = glob.glob("/home/itsuki/RGBD/rgbd_dataset_freiburg1_plant/depth/*.png")
-    rgb_filenames, depth_filenames = read_files()
-    frame_length = len(rgb_filenames)
-    print(rgb_filenames[0])
-    mapper.addCamera(rgb_filenames[0],
-                    depth_filenames[0],
-                    0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
-    tracking_camera = Camera(cv2.imread(rgb_filenames[0], cv2.IMREAD_COLOR), 
-                             cv2.imread(depth_filenames[0], cv2.IMREAD_ANYDEPTH), 
-                    0.0,0.0,0.0,1e-8,1e-8,1e-8,0.0,0.0)
-    for i in range(50):
-        mapper.mapping(batch_size=500)
-    last_pose = tracking_camera.params
-    camera_vel = torch.tensor([0.0,0.0,0.0,0.0,0.0,0.0, 0.0, 0.0]).detach().cuda().requires_grad_(True)
-    for frame in range(1,frame_length):
-        #mapper.mapping()
-        for i in range(10):
-            mapper.mapping(batch_size=500)
-        tracking_camera.params.data += camera_vel
-        tracking_camera.setImages(cv2.imread(rgb_filenames[frame], cv2.IMREAD_COLOR), 
-                                  cv2.imread(depth_filenames[frame], cv2.IMREAD_ANYDEPTH))
-        pe = mapper.track(tracking_camera)
-        camera_vel = 0.2 * camera_vel + 0.8*(tracking_camera.params-last_pose)
-        last_pose = tracking_camera.params
-        if pe < 0.65:
-            p = tracking_camera.params
-            mapper.addCamera(rgb_filenames[frame],
-                    depth_filenames[frame],
-                    last_pose[3],last_pose[4],last_pose[5],
-                    last_pose[0],last_pose[1],last_pose[2],
-                    last_pose[6],last_pose[7])
-            print("Add keyframe")
-            print(last_pose.cpu())
-            #for i in range(2):
-            #    mapper.mapping()
-        mapper.render_small(tracking_camera, "view")
-        #mapper.render_small(fixed_camera, "fixed_camera")
-
-
-main()
