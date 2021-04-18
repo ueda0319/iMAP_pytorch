@@ -1,7 +1,7 @@
 # iMAP-pytorch
 This is reproduction implementation for iMAP(https://edgarsucar.github.io/iMAP/)
 
-
+![tum_test](https://github.com/ueda0319/iMAP_pytorch/wiki/imgs/teddy.gif)
 ## dependency
 - PyTorch 1.8
 - opencv-python
