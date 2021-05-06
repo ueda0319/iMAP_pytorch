@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 import copy
 import time
-from visualizer import Visualizer
+#from visualizer import Visualizer
 #import mcubes
 @torch.jit.script
 def mish(x):

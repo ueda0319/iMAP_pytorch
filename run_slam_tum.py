@@ -7,7 +7,7 @@ import cv2
 import threading
 from model import Camera, Mapper
 
-def read_files(folder_path="/home/itsuki/RGBD/rgbd_dataset_freiburg1_teddy/"):
+def read_files(folder_path=r"/home/itsuki/RGBD/rgbd_dataset_freiburg1_teddy/"):
     csv_file = open(folder_path + "rgb.txt", "r")
     f = csv.reader(csv_file, delimiter=" ")
     next(f)
@@ -37,7 +37,7 @@ def main():
         rgb_filenames, depth_filenames = read_files(sys.argv[1])
     else:
         rgb_filenames, depth_filenames = read_files()
-    frame_length = len(rgb_filenames)
+    frame_length = min(len(rgb_filenames), len(depth_filenames))
     mapper.addCamera(rgb_filenames[0],
                     depth_filenames[0],
                     0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
