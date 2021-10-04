@@ -8,29 +8,6 @@ import threading
 import pyrealsense2 as rs
 import numpy as np
 from model import Camera, Mapper
-# load image files in TUM directories
-def read_files(folder_path="rgbd_dataset_freiburg1_teddy/"):
-    # rgb file pathes
-    csv_file = open(folder_path + "rgb.txt", "r")
-    f = csv.reader(csv_file, delimiter=" ")
-    # skip headers
-    next(f)
-    next(f)
-    next(f)
-    rgb_filenames = []
-    for row in f:
-        rgb_filenames.append("{}{}".format(folder_path, row[1]))
-    # depth file pathes
-    csv_file = open(folder_path + "depth.txt", "r")
-    f = csv.reader(csv_file, delimiter=" ")
-    # skip headers
-    next(f)
-    next(f)
-    next(f)
-    depth_filenames = []
-    for row in f:
-        depth_filenames.append("{}{}".format(folder_path, row[1]))
-    return rgb_filenames, depth_filenames
 
 # Thread for mapping loop
 def mappingThread(mapper):
@@ -63,16 +40,8 @@ def main():
         cv2.imread(color_img, 
                     depth_img, 
                     0.0,0.0,0.0,1e-8,1e-8,1e-8,0.0,0.0
-    ))
+    )))
 
-    if 2<= len(sys.argv):
-        rgb_filenames, depth_filenames = read_files(sys.argv[1])
-    else:
-        rgb_filenames, depth_filenames = read_files()
-    frame_length = len(rgb_filenames)
-    mapper.addCamera(rgb_filenames[0],
-                    depth_filenames[0],
-                    0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)
     fixed_camera = Camera(color_img, 
                             depth_img, 
                             0.0,0.0,0.0,1e-8,1e-8,1e-8,0.0,0.0)
